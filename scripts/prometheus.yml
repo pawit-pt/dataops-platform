@@ -1,0 +1,65 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# ----------------------------------------------------------------
+# Alert rules for DQ gate failures and pipeline health
+# ----------------------------------------------------------------
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+scrape_configs:
+
+  # ----------------------------------------------------------------
+  # Prometheus self-monitoring
+  # ----------------------------------------------------------------
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # ----------------------------------------------------------------
+  # Kafka metrics via kafka-exporter
+  # Exposes: topic offsets, consumer group lag, partition counts
+  # ----------------------------------------------------------------
+  - job_name: "kafka"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  # ----------------------------------------------------------------
+  # Flink metrics via built-in PrometheusReporter
+  # Exposes: job status, records in/out, checkpoint duration, restarts
+  # JobManager + TaskManager both expose on port 9249
+  # ----------------------------------------------------------------
+  - job_name: "flink-jobmanager"
+    static_configs:
+      - targets: ["flink-jobmanager:9249"]
+
+  - job_name: "flink-taskmanager"
+    static_configs:
+      - targets: ["flink-taskmanager:9249"]
+
+  # ----------------------------------------------------------------
+  # Airflow metrics via StatsD exporter
+  # Exposes: DAG run success/fail, task finish counts, DQ gate status
+  # ----------------------------------------------------------------
+  - job_name: "airflow"
+    static_configs:
+      - targets: ["statsd-exporter:9102"]
+
+  # ----------------------------------------------------------------
+  # MinIO S3 storage metrics (cluster-wide)
+  # Exposes: total capacity, drive status, cluster health
+  # ----------------------------------------------------------------
+  - job_name: "minio-cluster"
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: ["minio:9000"]
+
+  # ----------------------------------------------------------------
+  # MinIO S3 per-bucket metrics
+  # Exposes: bucket size, object count (with bucket label)
+  # ----------------------------------------------------------------
+  - job_name: "minio-bucket"
+    metrics_path: /minio/v2/metrics/bucket
+    static_configs:
+      - targets: ["minio:9000"]

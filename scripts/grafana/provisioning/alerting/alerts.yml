@@ -1,0 +1,443 @@
+# ================================================================
+# Grafana Unified Alerting Provisioning
+# ================================================================
+# This file provisions:
+#   1. Contact Points  — where alerts are sent (email, webhook, etc.)
+#   2. Notification Policies — routing rules (which alerts → which contact)
+#   3. Alert Rules — 7 rules matching Prometheus alert-rules.yml
+#
+# Grafana evaluates these rules directly against Prometheus data source.
+# Alerts appear in Grafana UI → Alerting → Alert Rules
+# ================================================================
+
+apiVersion: 1
+
+# ----------------------------------------------------------------
+# CONTACT POINTS
+# Define where alert notifications are delivered.
+# For local dev: uses Grafana's built-in "grafana-default-email" receiver
+# Production: replace with Slack webhook, PagerDuty, OpsGenie, etc.
+# ----------------------------------------------------------------
+contactPoints:
+  - orgId: 1
+    name: platform-alerts
+    receivers:
+      # Default: Grafana internal (shows in Alerting UI)
+      # Production: uncomment Slack or PagerDuty below
+      - uid: platform-default
+        type: email
+        settings:
+          addresses: platform-alerts@company.com
+        disableResolveMessage: false
+
+      # --- Slack (uncomment for production) ---
+      # - uid: platform-slack
+      #   type: slack
+      #   settings:
+      #     url: https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+      #     recipient: "#data-platform-alerts"
+      #     title: |
+      #       {{ template "slack.default.title" . }}
+      #     text: |
+      #       {{ template "slack.default.text" . }}
+
+      # --- PagerDuty (uncomment for production) ---
+      # - uid: platform-pagerduty
+      #   type: pagerduty
+      #   settings:
+      #     integrationKey: YOUR_PAGERDUTY_INTEGRATION_KEY
+      #     severity: critical
+
+# ----------------------------------------------------------------
+# NOTIFICATION POLICIES
+# Route alerts to the correct contact point based on labels.
+# ----------------------------------------------------------------
+policies:
+  - orgId: 1
+    receiver: platform-alerts
+    group_by:
+      - alertname
+      - severity
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 1h
+    routes:
+      # Critical DQ gate alerts — immediate notification
+      - receiver: platform-alerts
+        matchers:
+          - severity = critical
+          - component = dq_gate
+        group_wait: 10s
+        repeat_interval: 30m
+
+      # Critical pipeline alerts — immediate notification
+      - receiver: platform-alerts
+        matchers:
+          - severity = critical
+          - component =~ flink|airflow
+        group_wait: 10s
+        repeat_interval: 30m
+
+      # Warning alerts — less urgent
+      - receiver: platform-alerts
+        matchers:
+          - severity = warning
+        group_wait: 1m
+        repeat_interval: 2h
+
+# ----------------------------------------------------------------
+# ALERT RULES
+# 7 rules organized into 2 groups, matching Prometheus alert-rules.yml
+# Each rule queries Prometheus directly via Grafana datasource.
+# ----------------------------------------------------------------
+groups:
+  # ==============================================================
+  # GROUP 1: DQ Gate Alerts (Critical)
+  # Fires when any Data Quality check fails in Airflow.
+  # Task state="failed" counter increases → alert fires.
+  # ==============================================================
+  - orgId: 1
+    name: DQ Gate Alerts
+    folder: Platform Alerts
+    interval: 1m
+    rules:
+
+      # RULE 1: DQ Freshness Check Failed
+      # Silver table has no data in the last 2 hours.
+      # Gold layer INSERT is blocked to prevent serving stale data.
+      - uid: dq-freshness-failed
+        title: "DQ Freshness Check FAILED"
+        condition: C
+        for: 0m
+        labels:
+          severity: critical
+          component: dq_gate
+        annotations:
+          summary: "DQ Freshness check FAILED — Silver has no data in last 2 hours"
+          description: "The freshness DQ gate has failed. Gold layer INSERT is blocked. Check Silver table ingestion and Flink streaming jobs."
+          runbook_url: ""
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(airflow_task_finish_total{dag_id=~"gold_aggregation|test_alert_scenarios", task_id="dq_check_freshness", state="failed"}[1h])
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      # RULE 2: DQ Validity Check Failed
+      # Invalid record ratio exceeds 10% threshold.
+      # Gold layer INSERT is blocked to prevent bad data in business layer.
+      - uid: dq-validity-failed
+        title: "DQ Validity Check FAILED"
+        condition: C
+        for: 0m
+        labels:
+          severity: critical
+          component: dq_gate
+        annotations:
+          summary: "DQ Validity check FAILED — Invalid record ratio exceeds 10%"
+          description: "Too many invalid records in Silver table. Check data generator output and Flink validation logic."
+          runbook_url: ""
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(airflow_task_finish_total{dag_id=~"gold_aggregation|test_alert_scenarios", task_id="dq_check_invalid_ratio", state="failed"}[1h])
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      # RULE 3: DQ Null Check Failed
+      # NULL values found in critical fields: trip_id, route_name, base_fare.
+      # Gold layer INSERT is blocked.
+      - uid: dq-null-check-failed
+        title: "DQ Null Check FAILED"
+        condition: C
+        for: 0m
+        labels:
+          severity: critical
+          component: dq_gate
+        annotations:
+          summary: "DQ Null check FAILED — NULLs in trip_id, route_name, or base_fare"
+          description: "Critical fields contain NULL values. Check upstream data source and Flink transformation logic."
+          runbook_url: ""
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(airflow_task_finish_total{dag_id=~"gold_aggregation|test_alert_scenarios", task_id="dq_check_null_critical_fields", state="failed"}[1h])
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      # RULE 4: Gold Aggregation INSERT Failed
+      # The final Gold INSERT task has failed after DQ checks.
+      # Business users will not see updated data.
+      - uid: gold-aggregation-failed
+        title: "Gold Aggregation INSERT FAILED"
+        condition: C
+        for: 0m
+        labels:
+          severity: critical
+          component: airflow
+        annotations:
+          summary: "Gold INSERT task failed — gold.trips_hourly not updated"
+          description: "The hourly Gold aggregation has failed. Check Airflow logs and Trino connectivity."
+          runbook_url: ""
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 7200
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(airflow_task_finish_total{dag_id=~"gold_aggregation|test_alert_scenarios", task_id="insert_gold_trips_hourly", state="failed"}[2h])
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 7200
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 7200
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  # ==============================================================
+  # GROUP 2: Pipeline Health Alerts
+  # Monitors Flink streaming jobs and Kafka consumer health.
+  # ==============================================================
+  - orgId: 1
+    name: Pipeline Health Alerts
+    folder: Platform Alerts
+    interval: 1m
+    rules:
+
+      # RULE 5: Flink Streaming Jobs Not Running
+      # Expected 1 running job — Bronze INSERT + Silver INSERT run together
+      # as a single combined Flink STATEMENT SET job.
+      # If 0 jobs are running, data ingestion has fully stopped.
+      - uid: flink-job-not-running
+        title: "Flink Streaming Jobs Not Running"
+        condition: C
+        for: 2m
+        labels:
+          severity: critical
+          component: flink
+        annotations:
+          summary: "Flink ETL job not running — data ingestion stopped"
+          description: "Expected 1 running job (Bronze + Silver INSERTs run as a single combined STATEMENT SET). Check Flink UI at http://localhost:8081 and resubmit ETL pipeline if needed."
+          runbook_url: ""
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: flink_jobmanager_numRunningJobs
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
+              refId: C
+
+      # RULE 6: Flink Job Restarting Frequently
+      # More than 3 restarts in 10 minutes indicates instability.
+      # Could be OOM, checkpoint failures, or bad data causing crashes.
+      - uid: flink-job-restarting
+        title: "Flink Job Restarting Frequently"
+        condition: C
+        for: 0m
+        labels:
+          severity: warning
+          component: flink
+        annotations:
+          summary: "Flink job restarted > 3 times in 10 minutes"
+          description: "Frequent restarts indicate instability. Check Flink TaskManager logs for OOM errors, checkpoint failures, or serialization issues."
+          runbook_url: ""
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(flink_jobmanager_job_numRestarts[10m])
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [3]
+              refId: C
+
+      # RULE 7: Kafka Consumer Lag High
+      # Consumer group has > 10,000 messages of lag for 5+ minutes.
+      # Flink is not keeping up with incoming data rate.
+      - uid: kafka-consumer-lag-high
+        title: "Kafka Consumer Lag High"
+        condition: C
+        for: 5m
+        labels:
+          severity: warning
+          component: kafka
+        annotations:
+          summary: "Kafka consumer lag exceeds 10,000 messages"
+          description: "Consumer group {{ $labels.consumergroup }} has high lag on topic {{ $labels.topic }}. Consider scaling Flink TaskManagers or checking for processing bottlenecks."
+          runbook_url: ""
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: kafka_consumergroup_lag
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [10000]
+              refId: C

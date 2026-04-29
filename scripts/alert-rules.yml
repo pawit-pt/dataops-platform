@@ -1,0 +1,80 @@
+groups:
+  # ----------------------------------------------------------------
+  # DQ Gate Alerts: fires when any data quality check fails
+  # ----------------------------------------------------------------
+  - name: dq_gate_alerts
+    rules:
+      - alert: DQGateFreshnessFailed
+        expr: increase(airflow_task_finish_total{dag_id=~"gold_aggregation|test_alert_scenarios", task_id="dq_check_freshness", state="failed"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: dq_gate
+        annotations:
+          summary: "DQ Freshness check FAILED"
+          description: "Silver table has no data in the last 2 hours. Gold layer INSERT is blocked."
+
+      - alert: DQGateValidityFailed
+        expr: increase(airflow_task_finish_total{dag_id=~"gold_aggregation|test_alert_scenarios", task_id="dq_check_invalid_ratio", state="failed"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: dq_gate
+        annotations:
+          summary: "DQ Validity check FAILED"
+          description: "Invalid record ratio exceeds 10%. Gold layer INSERT is blocked."
+
+      - alert: DQGateNullCheckFailed
+        expr: increase(airflow_task_finish_total{dag_id=~"gold_aggregation|test_alert_scenarios", task_id="dq_check_null_critical_fields", state="failed"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: dq_gate
+        annotations:
+          summary: "DQ Null check FAILED"
+          description: "Null values found in critical fields (trip_id, route_name, base_fare). Gold layer INSERT is blocked."
+
+  # ----------------------------------------------------------------
+  # Pipeline Health Alerts
+  # ----------------------------------------------------------------
+  - name: pipeline_health_alerts
+    rules:
+      - alert: FlinkJobNotRunning
+        expr: flink_jobmanager_numRunningJobs < 1
+        for: 2m
+        labels:
+          severity: critical
+          component: flink
+        annotations:
+          summary: "Flink streaming jobs not running"
+          description: "Expected 1 running job (Bronze + Silver INSERTs run as a single combined job), but {{ $value }} are running."
+
+      - alert: FlinkJobRestarting
+        expr: increase(flink_jobmanager_job_numRestarts[10m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+          component: flink
+        annotations:
+          summary: "Flink job restarting frequently"
+          description: "Job has restarted {{ $value }} times in the last 10 minutes."
+
+      - alert: KafkaConsumerLagHigh
+        expr: kafka_consumergroup_lag > 10000
+        for: 5m
+        labels:
+          severity: warning
+          component: kafka
+        annotations:
+          summary: "Kafka consumer lag is high"
+          description: "Consumer group {{ $labels.consumergroup }} has {{ $value }} messages of lag on topic {{ $labels.topic }}."
+
+      - alert: GoldAggregationFailed
+        expr: increase(airflow_task_finish_total{dag_id=~"gold_aggregation|test_alert_scenarios", task_id="insert_gold_trips_hourly", state="failed"}[2h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: airflow
+        annotations:
+          summary: "Gold aggregation INSERT failed"
+          description: "The gold.trips_hourly INSERT task has failed. Check Airflow logs for details."

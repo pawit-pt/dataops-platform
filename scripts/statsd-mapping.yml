@@ -1,0 +1,69 @@
+mappings:
+  # ----------------------------------------------------------------
+  # Airflow DAG run metrics
+  # ----------------------------------------------------------------
+  - match: "airflow.dagrun.duration.success.*"
+    name: "airflow_dagrun_duration_seconds"
+    timer_type: "histogram"
+    labels:
+      dag_id: "$1"
+      status: "success"
+
+  - match: "airflow.dagrun.duration.failed.*"
+    name: "airflow_dagrun_duration_seconds"
+    timer_type: "histogram"
+    labels:
+      dag_id: "$1"
+      status: "failed"
+
+  # ----------------------------------------------------------------
+  # Airflow task instance finish (tracks DQ gate pass/fail)
+  # Format: airflow.ti.finish.<dag_id>.<task_id>.<state>
+  # ----------------------------------------------------------------
+  - match: "airflow.ti.finish.*.*.*"
+    name: "airflow_task_finish_total"
+    match_type: "glob"
+    labels:
+      dag_id: "$1"
+      task_id: "$2"
+      state: "$3"
+
+  # ----------------------------------------------------------------
+  # Airflow task duration
+  # ----------------------------------------------------------------
+  - match: "airflow.dag.*.*.duration"
+    name: "airflow_task_duration_seconds"
+    timer_type: "histogram"
+    labels:
+      dag_id: "$1"
+      task_id: "$2"
+
+  # ----------------------------------------------------------------
+  # Airflow task instance started
+  # ----------------------------------------------------------------
+  - match: "airflow.ti.start.*.*"
+    name: "airflow_task_start_total"
+    match_type: "glob"
+    labels:
+      dag_id: "$1"
+      task_id: "$2"
+
+  # ----------------------------------------------------------------
+  # Airflow scheduler metrics
+  # ----------------------------------------------------------------
+  - match: "airflow.scheduler.tasks.running"
+    name: "airflow_scheduler_tasks_running"
+
+  - match: "airflow.scheduler.tasks.starving"
+    name: "airflow_scheduler_tasks_starving"
+
+  - match: "airflow.dag_processing.total_parse_time"
+    name: "airflow_dag_processing_total_parse_time"
+
+  # ----------------------------------------------------------------
+  # Catch-all: drop unmatched metrics to avoid cardinality explosion
+  # ----------------------------------------------------------------
+  - match: "."
+    match_type: "regex"
+    action: "drop"
+    name: "dropped"

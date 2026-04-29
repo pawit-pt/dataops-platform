@@ -1,0 +1,60 @@
+{
+  "rootGroups": [
+    {
+      "name": "global",
+      "maxQueued": 500,
+      "hardConcurrencyLimit": 100,
+      "schedulingPolicy": "weighted",
+      "subGroups": [
+
+        {
+          "name": "team_a_reports",
+          "comment": "Team A: daily reports at 10am. Large scans, higher memory, fewer concurrent queries.",
+          "maxQueued": 50,
+          "hardConcurrencyLimit": 20,
+          "softConcurrencyLimit": 15,
+          "schedulingWeight": 30,
+          "softMemoryLimit": "40%"
+        },
+
+        {
+          "name": "team_b_monitoring",
+          "comment": "Team B: hourly sales monitoring. Small queries, fast turnaround, higher concurrency.",
+          "maxQueued": 100,
+          "hardConcurrencyLimit": 50,
+          "softConcurrencyLimit": 40,
+          "schedulingWeight": 50,
+          "softMemoryLimit": "30%"
+        },
+
+        {
+          "name": "adhoc",
+          "comment": "Data scientists / ad-hoc queries. Best-effort, limited to avoid starving scheduled jobs.",
+          "maxQueued": 50,
+          "hardConcurrencyLimit": 20,
+          "softConcurrencyLimit": 10,
+          "schedulingWeight": 20,
+          "softMemoryLimit": "20%"
+        }
+
+      ]
+    }
+  ],
+
+  "selectors": [
+    {
+      "user": "team_a.*",
+      "group": "global.team_a_reports"
+    },
+    {
+      "user": "team_b.*",
+      "group": "global.team_b_monitoring"
+    },
+    {
+      "user": ".*",
+      "group": "global.adhoc"
+    }
+  ],
+
+  "cpuQuotaPeriod": "1h"
+}

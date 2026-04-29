@@ -1,0 +1,432 @@
+version: "3.8"
+
+services:
+  # ============================================================
+  # INFRASTRUCTURE: Zookeeper (required by Kafka)
+  # ============================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    networks: [platform]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # INGESTION LAYER: Apache Kafka (single broker for local dev)
+  # Production: 3 brokers, replication-factor=3
+  # ============================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    networks: [platform]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092" # external access from your host
+      - "9101:9101" # JMX metrics
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1 # 1 for local, 3 in prod
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1 # 1 for local, 3 in prod
+      KAFKA_MIN_INSYNC_REPLICAS: 1 # 2 in prod
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168 # 7 days
+      KAFKA_JMX_PORT: 9101
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:9092",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ============================================================
+  # Kafka UI - browse topics, messages visually
+  # Access: http://localhost:8080
+  # ============================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    networks: [platform]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # ============================================================
+  # STORAGE LAYER: MinIO (S3-compatible object store)
+  # Simulates AWS S3 locally
+  # Console: http://localhost:9001  (admin / password)
+  # ============================================================
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    networks: [platform]
+    ports:
+      - "9000:9000" # S3 API endpoint
+      - "9001:9001" # Web console
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+      MINIO_PROMETHEUS_AUTH_TYPE: public # allow Prometheus to scrape without bearer token
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Creates the S3 buckets we need on startup
+  minio-setup:
+    image: minio/mc:latest
+    container_name: minio-setup
+    networks: [platform]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 admin password123;
+        mc mb --ignore-existing local/warehouse;
+        mc mb --ignore-existing local/checkpoints;
+        echo 'Buckets created: warehouse, checkpoints';
+        exit 0;
+      "
+
+  # ============================================================
+  # ICEBERG REST CATALOG
+  # Speaks the Iceberg REST spec — supported natively by both
+  # Flink (catalog-type=rest) and Trino (iceberg.catalog.type=rest)
+  # API: http://localhost:8181
+  # ============================================================
+  iceberg-rest:
+    image: tabulario/iceberg-rest:0.6.0
+    container_name: iceberg-rest
+    networks: [platform]
+    ports:
+      - "8181:8181"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_S3_ACCESS__KEY__ID: admin
+      CATALOG_S3_SECRET__ACCESS__KEY: password123
+      AWS_REGION: us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ============================================================
+  # STREAM PROCESSING: Apache Flink
+  # JobManager (coordinator) + TaskManager (worker)
+  # Web UI: http://localhost:8081
+  # ============================================================
+  flink-jobmanager:
+    build:
+      context: .
+      dockerfile: flink-custom/Dockerfile
+    container_name: flink-jobmanager
+    networks: [platform]
+    platform: linux/amd64
+    ports:
+      - "8081:8081" # Flink Web UI
+    command: jobmanager
+    environment:
+      AWS_REGION: us-east-1
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        # Checkpointing - fault tolerance core config
+        execution.checkpointing.interval: 60000
+        execution.checkpointing.mode: EXACTLY_ONCE
+        execution.checkpointing.min-pause: 30000
+        state.backend: rocksdb
+        state.checkpoints.dir: s3://checkpoints/flink
+        # S3 access for checkpoints
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+        s3.access-key: admin
+        s3.secret-key: password123
+        # Prometheus metrics reporter
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+    volumes:
+      - ./flink-jobs:/opt/flink/jobs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  flink-taskmanager:
+    build:
+      context: .
+      dockerfile: flink-custom/Dockerfile
+    container_name: flink-taskmanager
+    platform: linux/amd64
+    networks: [platform]
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    command: taskmanager
+    environment:
+      AWS_REGION: us-east-1
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 2048m
+        state.backend: rocksdb
+        state.checkpoints.dir: s3://checkpoints/flink
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+        s3.access-key: admin
+        s3.secret-key: password123
+        # Prometheus metrics reporter
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+    volumes:
+      - ./flink-jobs:/opt/flink/jobs
+
+  # ============================================================
+  # QUERY ENGINE: Trino
+  # JDBC endpoint for BI tools, DBeaver, notebooks
+  # Web UI: http://localhost:8082
+  # ============================================================
+  trino:
+    image: trinodb/trino:435
+    container_name: trino
+    networks: [platform]
+    ports:
+      - "8082:8080" # Trino Web UI + JDBC port
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+      - ./trino/resource-groups:/etc/trino/resource-groups
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ============================================================
+  # METADATA DB: PostgreSQL
+  # Used by Iceberg catalog + Airflow backend
+  # ============================================================
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    networks: [platform]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: platform
+      POSTGRES_DB: platform
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sql:/docker-entrypoint-initdb.d/init-airflow.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # OBSERVABILITY: Prometheus + Grafana + Exporters
+  # Grafana: http://localhost:3000  (admin / admin)
+  # Prometheus: http://localhost:9090
+  # ============================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    networks: [platform]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./scripts/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./scripts/alert-rules.yml:/etc/prometheus/alert-rules.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    networks: [platform]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_UNIFIED_ALERTING_ENABLED: "true"
+      GF_ALERTING_ENABLED: "false"
+    depends_on:
+      - prometheus
+    volumes:
+      - ./scripts/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./scripts/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ./scripts/grafana/provisioning/alerting:/etc/grafana/provisioning/alerting
+      - ./scripts/grafana/dashboards:/var/lib/grafana/dashboards
+
+  # Kafka Exporter: exposes topic offsets, consumer lag to Prometheus
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter
+    networks: [platform]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - "--kafka.server=kafka:29092"
+    restart: unless-stopped
+
+  # StatsD Exporter: converts Airflow StatsD metrics to Prometheus format
+  # Airflow sends metrics → StatsD exporter → Prometheus scrapes
+  statsd-exporter:
+    image: prom/statsd-exporter:latest
+    container_name: statsd-exporter
+    networks: [platform]
+    ports:
+      - "9102:9102" # Prometheus metrics endpoint
+      - "9125:9125/udp" # StatsD UDP receiver
+    command:
+      - "--statsd.mapping-config=/etc/statsd-mapping.yml"
+      - "--statsd.listen-udp=:9125"
+      - "--web.listen-address=:9102"
+    volumes:
+      - ./scripts/statsd-mapping.yml:/etc/statsd-mapping.yml
+
+  # ============================================================
+  # DATA GENERATOR: Simulates ride-sharing trip events
+  # Publishes to Kafka topic: raw.trip.events
+  # ============================================================
+  data-generator:
+    build:
+      context: ./data-generator
+      dockerfile: Dockerfile
+    container_name: data-generator
+    networks: [platform]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC: raw.trip.events
+      EVENTS_PER_SECOND: 5
+    restart: unless-stopped
+
+  # ============================================================
+  # SCHEDULER: Apache Airflow (LocalExecutor)
+  # Web UI: http://localhost:8085  (admin / admin)
+  # Metrics: StatsD → statsd-exporter → Prometheus
+  # ============================================================
+
+  # One-shot init: creates airflow DB, runs migrations, creates admin user
+  airflow-init:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: airflow-init
+    networks: [platform]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://platform:platform@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    volumes:
+      - ./airflow/init.sh:/opt/airflow/init.sh
+    command: ["bash", "/opt/airflow/init.sh"]
+
+  airflow-webserver:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: airflow-webserver
+    networks: [platform]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8085:8080"
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://platform:platform@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      # Trino connections (user determines resource group routing)
+      AIRFLOW_CONN_TRINO_DEFAULT: trino://airflow@trino:8080/iceberg
+      AIRFLOW_CONN_TRINO_TEAM_A: trino://team_a_airflow@trino:8080/iceberg
+      AIRFLOW_CONN_TRINO_TEAM_B: trino://team_b_airflow@trino:8080/iceberg
+      # StatsD metrics → statsd-exporter → Prometheus
+      AIRFLOW__METRICS__STATSD_ON: "true"
+      AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
+      AIRFLOW__METRICS__STATSD_PORT: "9125"
+      AIRFLOW__METRICS__STATSD_PREFIX: airflow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    command: airflow webserver
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  airflow-scheduler:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: airflow-scheduler
+    networks: [platform]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://platform:platform@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW_CONN_TRINO_DEFAULT: trino://airflow@trino:8080/iceberg
+      AIRFLOW_CONN_TRINO_TEAM_A: trino://team_a_airflow@trino:8080/iceberg
+      AIRFLOW_CONN_TRINO_TEAM_B: trino://team_b_airflow@trino:8080/iceberg
+      # StatsD metrics → statsd-exporter → Prometheus
+      AIRFLOW__METRICS__STATSD_ON: "true"
+      AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
+      AIRFLOW__METRICS__STATSD_PORT: "9125"
+      AIRFLOW__METRICS__STATSD_PREFIX: airflow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    command: airflow scheduler
+
+networks:
+  platform:
+    driver: bridge
+
+volumes:
+  minio-data:
+  postgres-data:
+  zookeeper-data:
+  kafka-data:
